@@ -63,6 +63,8 @@ body { background: var(--bg); color: var(--fg); font-family: var(--font-b); font
   padding: 8px 12px; border-radius: 6px; cursor: pointer;
 }
 .hud button[aria-pressed="true"] { background: var(--fg); color: var(--panel); border-color: var(--fg); }
+.hud .leve { margin-left: 8px; }
+.hud .leve[aria-pressed="true"] { background: var(--ok); border-color: var(--ok); color: var(--panel); }
 .hud button:hover, .btn:hover { border-color: var(--accent); }
 button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .legend { position: absolute; left: max(12px, env(safe-area-inset-left, 0px)); bottom: 12px; font: 12px/1.3 var(--font-m); color: var(--muted); background: color-mix(in srgb, var(--panel) 85%, transparent); padding: 6px 10px; border-radius: 6px; pointer-events: none; }
@@ -156,6 +158,7 @@ textarea.copybox { width: 100%; box-sizing: border-box; font: 12px/1.4 var(--fon
       <button id="vplan" aria-pressed="false">Planta</button>
       <button id="vsac" aria-pressed="false">Sacada do elevador</button>
       <button id="vmet" aria-pressed="false">Pav. de cima</button>
+      <button id="vleve" class="leve" aria-pressed="false">Modo leve</button>
     </div>
     <div class="legend" id="legend">Arraste para girar · role para zoom · clique num guarda-corpo</div>
   </div>
@@ -332,7 +335,7 @@ function geom(s) {
 // ---------- cena ----------
 const stage = document.getElementById("stage");
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.outputEncoding = THREE.sRGBEncoding;
 renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 stage.prepend(renderer.domElement);
@@ -346,6 +349,12 @@ sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
 Object.assign(sun.shadow.camera, { left: -20, right: 20, top: 20, bottom: -20, near: 1, far: 80 });
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02;
 scene.add(sun);
+
+// Desenha só quando algo muda; a sombra é recalculada apenas depois de uma remontagem.
+renderer.shadowMap.autoUpdate = false;
+let needsRender = true;
+function invalidate() { needsRender = true; renderer.shadowMap.needsUpdate = true; }
+controls.addEventListener("change", () => { needsRender = true; });
 
 const M = {
   wall: new THREE.MeshStandardMaterial({ roughness: 0.95 }),
@@ -372,6 +381,7 @@ function netTexture() {
   const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; return t;
 }
 const NET = netTexture();
+M.tela = new THREE.MeshBasicMaterial({ map: NET, transparent: true, side: THREE.DoubleSide, depthWrite: false });
 
 function textTexture(text, color, px = 44, weight = 600) {
   const c = document.createElement("canvas"), g = c.getContext("2d");
@@ -381,17 +391,89 @@ function textTexture(text, color, px = 44, weight = 600) {
   const t = new THREE.CanvasTexture(c); t.anisotropy = 4; return { t, aspect: w / c.height };
 }
 
+// ---------- desempenho: uma malha por material ----------
+// Cada grupo é montado peça a peça e depois juntado numa malha por material, o que derruba
+// as chamadas de desenho. Cada malha guarda a faixa de triângulos de cada peça, para o clique
+// continuar identificando o trecho, o braço, o painel ou o funcionário.
+const PICK_KEYS = ["seg", "met", "worker"];
+function prepGeo(o, inv) {
+  const g = o.geometry.index ? o.geometry.toNonIndexed() : o.geometry.clone();
+  g.applyMatrix4(new THREE.Matrix4().multiplyMatrices(inv, o.matrixWorld));
+  const uv = o.userData.uv;   // repetição da textura por peça, gravada nas coordenadas UV
+  if (uv && g.attributes.uv) { const a = g.attributes.uv.array; for (let i = 0; i < a.length; i += 2) { a[i] *= uv[0]; a[i + 1] *= uv[1]; } }
+  return g;
+}
+function mergeGeos(geos) {
+  let n = 0; for (const g of geos) n += g.attributes.position.count;
+  const pos = new Float32Array(n * 3), nor = new Float32Array(n * 3), uv = new Float32Array(n * 2);
+  let k = 0;
+  for (const g of geos) {
+    pos.set(g.attributes.position.array, k * 3);
+    if (g.attributes.normal) nor.set(g.attributes.normal.array, k * 3);
+    if (g.attributes.uv) uv.set(g.attributes.uv.array, k * 2);
+    k += g.attributes.position.count; g.dispose();
+  }
+  const m = new THREE.BufferGeometry();
+  m.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  m.setAttribute("normal", new THREE.BufferAttribute(nor, 3));
+  m.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+  m.computeBoundingSphere(); m.computeBoundingBox();
+  return m;
+}
+function bakeInPlace(g) {
+  g.updateMatrixWorld(true);
+  const inv = g.matrixWorld.clone().invert(), buckets = new Map(), keep = [], used = new Set();
+  g.traverse(o => {
+    if (o === g) return;
+    if (o.isMesh && !o.isInstancedMesh) {
+      const key = o.material.uuid + (o.castShadow ? "c" : "") + (o.receiveShadow ? "r" : "") + "|" + o.renderOrder;
+      let b = buckets.get(key);
+      if (!b) buckets.set(key, b = { mat: o.material, cast: o.castShadow, recv: o.receiveShadow, order: o.renderOrder, geos: [], ranges: [], tris: 0 });
+      const geo = prepGeo(o, inv);
+      b.tris += geo.attributes.position.count / 3;
+      const data = {}; for (const k of PICK_KEYS) if (o.userData[k] !== undefined) data[k] = o.userData[k];
+      b.geos.push(geo); b.ranges.push({ end: b.tris, data });
+      if (o.geometry !== UNIT) used.add(o.geometry);
+    } else if (o.isSprite || o.isInstancedMesh || o.isLine) {
+      const m = new THREE.Matrix4().multiplyMatrices(inv, o.matrixWorld); m.decompose(o.position, o.quaternion, o.scale);
+      keep.push(o);
+    }
+  });
+  g.clear();
+  for (const geo of used) geo.dispose();
+  for (const o of keep) g.add(o);
+  for (const b of buckets.values()) {
+    const m = new THREE.Mesh(mergeGeos(b.geos), b.mat);
+    m.castShadow = b.cast; m.receiveShadow = b.recv; m.renderOrder = b.order; m.userData.ranges = b.ranges;
+    g.add(m);
+  }
+}
+function pickData(hit) {
+  const r = hit.object.userData.ranges;
+  if (!r) return hit.object.userData;
+  let lo = 0, hi = r.length - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (hit.faceIndex < r[mid].end) hi = mid; else lo = mid + 1; }
+  return r[lo].data;
+}
+function disposeGroup(g) {
+  g.traverse(o => {
+    if (o.geometry && o.geometry !== UNIT) o.geometry.dispose();
+    if (o.isSprite || o.userData.ownMat) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
+  });
+  g.clear();
+}
+
 const gWalls = new THREE.Group(), gPlat = new THREE.Group(), gLabels = new THREE.Group(), gRails = new THREE.Group(), gDim = new THREE.Group();
 scene.add(gWalls, gPlat, gLabels, gRails, gDim);
 function buildWalls() {
-  gWalls.traverse(o => { if (o.geometry) o.geometry.dispose(); });
-  gWalls.clear();
+  disposeGroup(gWalls);
   for (const poly of GEO.walls) {
     const sh = new THREE.Shape(poly.map(([x, y]) => new THREE.Vector2(x, y)));
     const geo = new THREE.ExtrudeGeometry(sh, { depth: P.pe, bevelEnabled: false });
     const m = new THREE.Mesh(geo, M.wall); m.rotation.x = -Math.PI / 2;
     m.castShadow = m.receiveShadow = true; gWalls.add(m);
   }
+  bakeInPlace(gWalls); invalidate();
 }
 function buildPlat() {
   const pts = [];
@@ -399,23 +481,23 @@ function buildPlat() {
   const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
   gPlat.add(new THREE.LineSegments(g, M.plat));
 }
-function buildLabels() {
-  gLabels.children.forEach(o => { o.material.map.dispose(); o.material.dispose(); o.geometry.dispose(); });
-  gLabels.clear();
-  const col = css("--label");
-  for (const { t, p } of GEO.labels) {
-    const { t: tex, aspect } = textTexture(t, col, 40, 500);
-    const h = 0.32, m = new THREE.Mesh(new THREE.PlaneGeometry(h * aspect, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
-    m.rotation.x = -Math.PI / 2; m.position.set(p[0] + h * aspect / 2, 0.01, -p[1]); gLabels.add(m);
-  }
+function buildLabels() {   // todos os nomes numa única imagem deitada sobre o piso
+  disposeGroup(gLabels);
+  const [x0, y0, x1, y1] = GEO.bounds, ppm = 90, pad = 0.5;
+  const W = Math.ceil((x1 - x0 + 2 * pad) * ppm), H = Math.ceil((y1 - y0 + 2 * pad) * ppm);
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const g = c.getContext("2d");
+  g.font = `500 ${Math.round(0.28 * ppm)}px "IBM Plex Sans", "Segoe UI", sans-serif`;
+  g.fillStyle = css("--label"); g.textBaseline = "middle";
+  for (const { t, p } of GEO.labels) g.fillText(t, (p[0] - x0 + pad) * ppm, (y1 + pad - p[1]) * ppm);
+  const tex = new THREE.CanvasTexture(c); tex.anisotropy = 8; tex.encoding = THREE.sRGBEncoding;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(W / ppm, H / ppm), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+  m.rotation.x = -Math.PI / 2; m.position.set((x0 + x1) / 2, 0.01, -(y0 + y1) / 2); m.userData.ownMat = true;
+  gLabels.add(m); invalidate();
 }
 
 function buildRails() {
-  for (const g of [gRails, gDim]) g.traverse(o => {
-    if (o.geometry) o.geometry.dispose();
-    if (o.userData.tela || o.isSprite) { o.material.map.dispose(); o.material.dispose(); }
-  });
-  gRails.clear(); gDim.clear();
+  disposeGroup(gRails); disposeGroup(gDim);
   const telaOn = document.getElementById("t-tela").checked;
   for (const s of SEGS) {
     if (!s.on) continue;
@@ -434,9 +516,8 @@ function buildRails() {
     board(P.bw, P.mid);
     if (P.rod > 0) board(P.rod, P.rod / 2);
     if (telaOn) {
-      const t = NET.clone(); t.needsUpdate = true; t.repeat.set(G.Lt / 0.5, G.H / 0.5);
-      const m = new THREE.Mesh(new THREE.PlaneGeometry(G.Lt, G.H), new THREE.MeshBasicMaterial({ map: t, transparent: true, side: THREE.DoubleSide, depthWrite: false }));
-      m.position.set(0, G.H / 2, zOut); m.userData.tela = true; grp.add(m);
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(G.Lt, G.H), M.tela);
+      m.position.set(0, G.H / 2, zOut); m.userData.tela = true; m.userData.uv = [G.Lt / 0.5, G.H / 0.5]; grp.add(m);
     }
     grp.traverse(o => { o.userData.seg = s.id; if (o.isMesh && !o.userData.tela) o.castShadow = true; });
     gRails.add(grp);
@@ -449,6 +530,7 @@ function buildRails() {
       sp2.scale.set(0.32 * a2, 0.32, 1); sp2.position.set(G.mx, G.H + 0.12, -G.my); sp2.renderOrder = 10; gDim.add(sp2);
     }
   }
+  bakeInPlace(gRails); invalidate();
 }
 
 function applyTheme() {
@@ -480,6 +562,7 @@ function meshTexture() {
   const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 8; return t;
 }
 const MESH = meshTexture();
+M.malha = new THREE.MeshBasicMaterial({ map: MESH, transparent: true, side: THREE.DoubleSide, depthWrite: false });
 
 function offsetPoly(pts, d) {
   const n = pts.length; let area = 0;
@@ -506,8 +589,7 @@ function metLayout() {
   return { panels, per };
 }
 function buildMet() {
-  for (const o of gMet.children) o.traverse(c => { if (c.userData.tex) { c.material.map.dispose(); c.material.dispose(); } if (c.geometry && c.geometry !== UNIT) c.geometry.dispose(); });
-  gMet.clear();
+  disposeGroup(gMet);
   const top = P.pe, y0 = top - PM.base;
   const hook = k => y0 + PM.entre + PM.g1 + k * PM.passo;
   MET.bracos.forEach(([x, y, deg], i) => {
@@ -537,13 +619,13 @@ function buildMet() {
     box(g, st, L, f, f, 0, yb + H - f / 2, 0); box(g, st, L, f, f, 0, yb + f / 2, 0);
     box(g, st, f, H, f, -L / 2 + f / 2, yb + H / 2, 0); box(g, st, f, H, f, L / 2 - f / 2, yb + H / 2, 0);
     if (PM.rod > 0) box(g, gv, L - 2 * f, PM.rod, 0.004, 0, yb + f + PM.rod / 2, k * 0.017);
-    const t = MESH.clone(); t.needsUpdate = true; t.repeat.set(L / PM.mx, H / PM.my);
-    const m = new THREE.Mesh(new THREE.PlaneGeometry(L - 2 * f, H - 2 * f), new THREE.MeshBasicMaterial({ map: t, transparent: true, side: THREE.DoubleSide, depthWrite: false }));
-    m.position.set(0, yb + H / 2, 0); m.userData.tex = true; g.add(m);
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(L - 2 * f, H - 2 * f), M.malha);
+    m.position.set(0, yb + H / 2, 0); m.userData.tex = true; m.userData.uv = [L / PM.mx, H / PM.my]; g.add(m);
     g.traverse(o => { o.userData.met = { kind: "painel", i }; });
     gMet.add(g);
   });
   gMet.traverse(o => { if (o.isMesh && !o.userData.tex) o.castShadow = true; });
+  bakeInPlace(gMet); invalidate();
 }
 function metSelect(s) {
   metSel = s; buildMet();
@@ -732,10 +814,6 @@ const PALLETS = [[-5.4, 3.4, 0], [4.6, -2.2, 0.3], [-10.2, -5.0, 0], [10.4, 4.6,
 
 const gEscoras = new THREE.Group(), gForma = new THREE.Group(), gMat = new THREE.Group();
 scene.add(gEscoras, gForma, gMat);
-function disposeGroup(g) {
-  g.traverse(o => { if (o.geometry && o.geometry !== UNIT) o.geometry.dispose(); if (o.userData.ownMat) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); } });
-  g.clear();
-}
 function buildObra() {
   for (const g of [gEscoras, gForma, gMat]) disposeGroup(g);
   seed = 23;
@@ -777,8 +855,7 @@ function buildObra() {
   }
   // assoalho de compensado em parte da laje de cima
   const d = box(gForma, M.ply, DECK.x1 - DECK.x0, 0.018, DECK.y1 - DECK.y0, (DECK.x0 + DECK.x1) / 2, pe + 0.009, -(DECK.y0 + DECK.y1) / 2);
-  const tp = TEX.ply.clone(); tp.needsUpdate = true; tp.repeat.set((DECK.x1 - DECK.x0) / 1.1, (DECK.y1 - DECK.y0) / 2.2);
-  d.material = new THREE.MeshStandardMaterial({ map: tp, roughness: 0.7 }); d.userData.ownMat = true; d.castShadow = d.receiveShadow = true;
+  d.userData.uv = [(DECK.x1 - DECK.x0) / 1.1, (DECK.y1 - DECK.y0) / 2.2]; d.castShadow = d.receiveShadow = true;
   // linha de vida no assoalho
   const lvx = LINHA.x, yA = LINHA.y0, yB = LINHA.y1, top = pe + 0.018 + LINHA.h;
   for (const yy of [yA, yB]) { const m = box(gForma, M.steel, 0.06, LINHA.h, 0.06, lvx, pe + 0.018 + LINHA.h / 2, -yy); m.castShadow = true; }
@@ -788,9 +865,8 @@ function buildObra() {
   for (const [x, y, r] of PALLETS) {
     const g = new THREE.Group(); g.position.set(x, 0, -y); g.rotation.y = r;
     const p = box(g, M.pine, 1.0, 0.12, 1.0, 0, 0.06, 0); p.castShadow = true;
-    const t = TEX.block.clone(); t.needsUpdate = true; t.repeat.set(0.8 / 0.8, 1.2 / 0.8);
-    const b = new THREE.Mesh(UNIT, new THREE.MeshStandardMaterial({ map: t, roughness: 0.95 }));
-    b.scale.set(0.8, 1.2, 0.78); b.position.y = 0.12 + 0.6; b.userData.ownMat = true; b.castShadow = b.receiveShadow = true; g.add(b);
+    const b = new THREE.Mesh(UNIT, M.wall);   // a textura de bloco já repete 1,25× por unidade de UV
+    b.scale.set(0.8, 1.2, 0.78); b.position.y = 0.12 + 0.6; b.userData.uv = [0.8, 1.2]; b.castShadow = b.receiveShadow = true; g.add(b);
     gMat.add(g);
   }
   // vergalhões de arranque saindo dos furos dos blocos no topo das paredes
@@ -804,6 +880,7 @@ function buildObra() {
   const reb = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.0063, 0.0063, 0.7, 5), M.rebar, bars.length);
   bars.forEach(([x, y], i) => { mtx.makeTranslation(x, pe + 0.35, -y); reb.setMatrixAt(i, mtx); });
   gMat.add(reb);
+  bakeInPlace(gForma); bakeInPlace(gMat); invalidate();
 }
 
 // ---------- equipe com EPI ----------
@@ -832,12 +909,18 @@ const WORKERS = [
 WORKERS.forEach(w => { if (w.piso === "tipo") [w.x, w.y] = pertoLivre(w.x, w.y, 0.35); });
 let workerSel = null;
 const gWorkers = new THREE.Group(); scene.add(gWorkers);
-const animated = [];
+const MATC = new Map();   // materiais compartilhados por cor, para as peças da equipe se juntarem
+function matC(color, extra = {}) {
+  const key = color + JSON.stringify(extra);
+  if (!MATC.has(key)) MATC.set(key, new THREE.MeshStandardMaterial({ color, roughness: 0.8, ...extra }));
+  return MATC.get(key);
+}
+M.vest = new THREE.MeshStandardMaterial({ map: TEX.vest, roughness: 0.6 });
 
 function makeWorker(w) {
-  const mat = c => new THREE.MeshStandardMaterial({ color: c, roughness: 0.8 });
+  const mat = c => matC(c);
   const skin = mat(0xc08660), shirt = mat(w.camisa), pants = mat(w.calca), boot = mat(0x1c1c1c), glove = mat(0xc9a24a);
-  const helm = new THREE.MeshStandardMaterial({ color: w.capacete, roughness: 0.35 });
+  const helm = matC(w.capacete, { roughness: 0.35 });
   const strap = mat(0xe3b512), dark = mat(0x141414);
   const g = new THREE.Group();
   const add = (parent, m, sx, sy, sz, x, y, z) => box(parent, m, sx, sy, sz, x, y, z);
@@ -847,7 +930,7 @@ function makeWorker(w) {
   }
   add(g, pants, 0.36, 0.16, 0.21, 0, 0.94, 0);
   add(g, shirt, 0.4, 0.52, 0.23, 0, 1.27, 0);
-  if (w.colete) { const v = add(g, new THREE.MeshStandardMaterial({ map: TEX.vest, roughness: 0.6 }), 0.42, 0.42, 0.25, 0, 1.25, 0); }
+  if (w.colete) add(g, M.vest, 0.42, 0.42, 0.25, 0, 1.25, 0);
   const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.055, 0.1, 10), skin); neck.position.y = 1.57; g.add(neck);
   const head = new THREE.Mesh(new THREE.SphereGeometry(0.11, 18, 14), skin); head.scale.y = 1.12; head.position.y = 1.69; g.add(head);
   // capacete com aba e jugular
@@ -857,7 +940,7 @@ function makeWorker(w) {
   for (const s of [-1, 1]) add(g, dark, 0.012, 0.15, 0.012, s * 0.105, 1.64, 0.02);
   add(g, dark, 0.2, 0.012, 0.012, 0, 1.565, 0.07);
   // óculos
-  const lens = new THREE.MeshStandardMaterial({ color: 0x223040, roughness: 0.1, metalness: 0.3, transparent: true, opacity: 0.8 });
+  const lens = matC(0x223040, { roughness: 0.1, metalness: 0.3, transparent: true, opacity: 0.8 });
   add(g, lens, 0.19, 0.045, 0.03, 0, 1.7, 0.105);
   if (w.abafador) for (const s of [-1, 1]) {
     const c = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.045, 14), mat(0xd23a2a)); c.rotation.z = Math.PI / 2; c.position.set(s * 0.12, 1.68, 0); g.add(c);
@@ -875,8 +958,7 @@ function makeWorker(w) {
   const pose = (r, l) => { R.sh.rotation.x = r[0]; R.el.rotation.x = r[1]; L.sh.rotation.x = l[0]; L.el.rotation.x = l[1]; };
   if (w.pose === "bloco") {
     pose([-0.95, -0.55], [-0.95, -0.55]);
-    const t = TEX.block.clone(); t.needsUpdate = true; t.repeat.set(0.5, 0.25);
-    const b = add(g, new THREE.MeshStandardMaterial({ map: t }), 0.39, 0.19, 0.14, 0, 1.03, 0.45); b.userData.ownMat = true;
+    add(g, M.wall, 0.39, 0.19, 0.14, 0, 1.03, 0.45).userData.uv = [0.4, 0.2];
   } else if (w.pose === "trena") {
     pose([-1.25, -0.15], [-0.85, -0.55]);
     add(R.el, mat(0xf0c020), 0.08, 0.08, 0.05, 0, -0.42, 0.02);
@@ -890,7 +972,6 @@ function makeWorker(w) {
     pose([-2.1, -0.9], [-0.7, -0.5]);
     add(R.el, mat(0x5a3a22), 0.03, 0.3, 0.03, 0, -0.42, 0.12).rotation.x = 1.4;
     add(R.el, mat(0x30343a), 0.04, 0.05, 0.13, 0, -0.42, 0.26);
-    animated.push({ arm: R, base: -2.1 });
   } else if (w.pose === "vergalhao") {
     pose([-0.75, -0.6], [-0.75, -0.6]);
     const b = new THREE.Mesh(new THREE.CylinderGeometry(0.0063, 0.0063, 2.4, 5), M.rebar); b.rotation.z = Math.PI / 2; b.position.set(0, 1.08, 0.42); g.add(b);
@@ -913,7 +994,7 @@ function cylBetween(a, b, r, m) {
   return c;
 }
 function buildWorkers() {
-  disposeGroup(gWorkers); animated.length = 0;
+  disposeGroup(gWorkers);
   for (const w of WORKERS) {
     const g = makeWorker(w);
     const base = w.piso === "cima" ? P.pe + 0.018 : 0;
@@ -924,7 +1005,7 @@ function buildWorkers() {
       const p = g.localToWorld(new THREE.Vector3(0, 1.42, -0.15));
       const q = new THREE.Vector3(LINHA.x, P.pe + 0.018 + LINHA.h, Math.max(-LINHA.y1, Math.min(-LINHA.y0, p.z)));
       const mid = p.clone().lerp(q, 0.5); mid.y -= 0.25;
-      const ty = new THREE.MeshStandardMaterial({ color: 0xf0b400, roughness: 0.6 });
+      const ty = matC(0xf0b400, { roughness: 0.6 });
       gWorkers.add(cylBetween(p, mid, 0.012, ty), cylBetween(mid, q, 0.012, ty));
     }
     if (workerSel === w.id) {
@@ -935,6 +1016,7 @@ function buildWorkers() {
       sp.position.set(w.x, base + 2.15, -w.y); sp.renderOrder = 10; gWorkers.add(sp);
     }
   }
+  bakeInPlace(gWorkers); invalidate();
 }
 function selectWorker(id, fly) {
   workerSel = id; buildWorkers(); renderTeam();
@@ -990,6 +1072,7 @@ camera.position.set(-20, 25, 27); controls.target.set(0, 0, 0);
 function resize() {
   const w = stage.clientWidth, h = stage.clientHeight;
   renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+  needsRender = true;
 }
 new ResizeObserver(resize).observe(stage);
 
@@ -998,9 +1081,11 @@ function loop(now) {
     const t = Math.min(1, (now - tween.start) / tween.dur), e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
     camera.position.lerpVectors(tween.p0, tween.p1, e); controls.target.lerpVectors(tween.t0, tween.t1, e);
     if (t >= 1) tween = null;
+    needsRender = true;
   }
-  if (!reduce) for (const a of animated) { const s = Math.sin(now / 260); a.arm.sh.rotation.x = a.base + s * 0.35; a.arm.el.rotation.x = -0.9 + s * 0.25; }
-  controls.update(); renderer.render(scene, camera); requestAnimationFrame(loop);
+  controls.update();
+  if (needsRender) { needsRender = false; renderer.render(scene, camera); }
+  requestAnimationFrame(loop);
 }
 
 // ---------- seleção por clique ----------
@@ -1014,9 +1099,10 @@ renderer.domElement.addEventListener("pointerup", e => {
   const targets = [...(gRails.visible ? gRails.children : []), ...(gMet.visible ? gMet.children : []), ...(gWorkers.visible ? gWorkers.children : [])];
   const hit = ray.intersectObjects(targets, true)[0];
   if (!hit) return;
-  if (hit.object.userData.worker) selectWorker(hit.object.userData.worker, false);
-  else if (hit.object.userData.seg) select(hit.object.userData.seg, false);
-  else if (hit.object.userData.met) metSelect(hit.object.userData.met);
+  const d = pickData(hit);
+  if (d.worker) selectWorker(d.worker, false);
+  else if (d.seg) select(d.seg, false);
+  else if (d.met) metSelect(d.met);
 });
 
 // ---------- painel ----------
@@ -1146,11 +1232,29 @@ for (const k of [0, 1]) document.getElementById("pos" + k).onclick = () => {
 };
 for (const k of Object.keys(VIEWS)) document.getElementById(k).onclick = () => setView(k);
 
+// Qualquer mudança no painel lateral pede um novo desenho (os controles já atualizaram a cena).
+for (const ev of ["input", "change", "click"]) document.querySelector(".panel").addEventListener(ev, invalidate);
+
+// Modo leve: sem sombras, sem escoramento e resolução 1:1, para computadores mais fracos.
+let leve = false;
+try { leve = localStorage.getItem("modoLeve") === "1"; } catch (e) {}
+function aplicarModoLeve() {
+  document.getElementById("vleve").setAttribute("aria-pressed", String(leve));
+  renderer.shadowMap.enabled = !leve;
+  renderer.setPixelRatio(leve ? 1 : Math.min(devicePixelRatio, 1.5));
+  document.getElementById("t-escoras").checked = !leve; gEscoras.visible = !leve;
+  scene.traverse(o => { if (o.material) [].concat(o.material).forEach(m => { m.needsUpdate = true; }); });
+  resize(); invalidate();
+  try { localStorage.setItem("modoLeve", leve ? "1" : "0"); } catch (e) {}
+}
+document.getElementById("vleve").onclick = () => { leve = !leve; aplicarModoLeve(); };
+
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
 new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
 buildWalls(); buildPlat(); applyTheme(); buildMet(); buildObra(); buildWorkers();
 renderList(); renderSel(); renderQty(); renderMet(); renderTeam(); resize();
+if (leve) aplicarModoLeve();
 requestAnimationFrame(loop);
 if (document.fonts) document.fonts.ready.then(buildLabels);
 </script>
