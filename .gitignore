@@ -1,0 +1,4 @@
+*.dwg
+*.dxf
+*.bak
+__pycache__/
